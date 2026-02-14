@@ -23,6 +23,7 @@ import android.media.ThumbnailUtils;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -91,9 +92,10 @@ public class MainActivity extends AppCompatActivity {
     private ImageButton btnCapture, btnSwitchCamera, btnFlash, btnGrid;
     private TextView modePhoto, modeVideo;
     private ImageView ivGalleryThumb;
-    private CardView cardGallery;
+    private CardView cardGallery, cardGpsStatus;
     private View shutterFlash, gridOverlay;
 
+    private ProcessCameraProvider cameraProvider;
     private ImageCapture imageCapture;
     private VideoCapture<Recorder> videoCapture;
     private Recording recording = null;
@@ -121,6 +123,7 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        // Bind UI Elements
         viewFinder = findViewById(R.id.viewFinder);
         tvLatLong = findViewById(R.id.tv_lat_long);
         tvDateTime = findViewById(R.id.tv_date_time);
@@ -135,6 +138,7 @@ public class MainActivity extends AppCompatActivity {
         modeVideo = findViewById(R.id.mode_video);
         ivGalleryThumb = findViewById(R.id.iv_gallery_thumb);
         cardGallery = findViewById(R.id.card_gallery);
+        cardGpsStatus = findViewById(R.id.card_gps_status);
         shutterFlash = findViewById(R.id.shutter_flash);
         gridOverlay = findViewById(R.id.grid_overlay);
 
@@ -142,14 +146,14 @@ public class MainActivity extends AppCompatActivity {
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this);
 
         if (allPermissionsGranted()) {
-            startCamera();
+            setupCamera();
             startLocationUpdates();
         } else {
             ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS);
         }
 
         setupClickListeners();
-        checkNetworkStatus();
+        registerNetworkCallback();
     }
 
     private void setupClickListeners() {
@@ -162,10 +166,7 @@ public class MainActivity extends AppCompatActivity {
         });
 
         btnSwitchCamera.setOnClickListener(v -> {
-            if (isVideoMode && recording != null) {
-                isSwitchingCameraDuringRecording = true;
-                stopRecording();
-            }
+            if (recording != null) return;
             lensFacing = (lensFacing == CameraSelector.LENS_FACING_BACK) ?
                     CameraSelector.LENS_FACING_FRONT : CameraSelector.LENS_FACING_BACK;
             startCamera();
@@ -177,18 +178,14 @@ public class MainActivity extends AppCompatActivity {
         modeVideo.setOnClickListener(v -> setMode(true));
 
         cardGallery.setOnClickListener(v -> {
-            Intent intent;
             if (lastSavedUri != null) {
-                intent = new Intent(Intent.ACTION_VIEW);
+                Intent intent = new Intent(Intent.ACTION_VIEW);
                 intent.setDataAndType(lastSavedUri, isVideoMode ? "video/*" : "image/*");
                 intent.setFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            } else {
-                intent = new Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
-            }
-            try {
                 startActivity(intent);
-            } catch (Exception e) {
-                Toast.makeText(this, "Gallery app not found", Toast.LENGTH_SHORT).show();
+            } else {
+                Intent intent = new Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+                try { startActivity(intent); } catch (Exception e) { Toast.makeText(this, "Gallery not found", Toast.LENGTH_SHORT).show(); }
             }
         });
     }
@@ -202,30 +199,33 @@ public class MainActivity extends AppCompatActivity {
         startCamera();
     }
 
-    private void startCamera() {
+    private void setupCamera() {
         ListenableFuture<ProcessCameraProvider> cameraProviderFuture = ProcessCameraProvider.getInstance(this);
         cameraProviderFuture.addListener(() -> {
             try {
-                ProcessCameraProvider cameraProvider = cameraProviderFuture.get();
-                Preview preview = new Preview.Builder().build();
-                preview.setSurfaceProvider(viewFinder.getSurfaceProvider());
-                CameraSelector cameraSelector = new CameraSelector.Builder().requireLensFacing(lensFacing).build();
-                cameraProvider.unbindAll();
-                if (isVideoMode) {
-                    Recorder recorder = new Recorder.Builder().setQualitySelector(QualitySelector.from(Quality.HIGHEST)).build();
-                    videoCapture = VideoCapture.withOutput(recorder);
-                    camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, videoCapture);
-                    camera.getCameraControl().enableTorch(flashMode == ImageCapture.FLASH_MODE_ON);
-                    if (isSwitchingCameraDuringRecording) {
-                        isSwitchingCameraDuringRecording = false;
-                        new Handler(Looper.getMainLooper()).postDelayed(this::startRecording, 500);
-                    }
-                } else {
-                    imageCapture = new ImageCapture.Builder().setFlashMode(flashMode).build();
-                    camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageCapture);
-                }
+                cameraProvider = cameraProviderFuture.get();
+                startCamera();
             } catch (Exception e) { Log.e(TAG, "Camera fail", e); }
         }, ContextCompat.getMainExecutor(this));
+    }
+
+    private void startCamera() {
+        if (cameraProvider == null) return;
+        
+        Preview preview = new Preview.Builder().build();
+        preview.setSurfaceProvider(viewFinder.getSurfaceProvider());
+        CameraSelector cameraSelector = new CameraSelector.Builder().requireLensFacing(lensFacing).build();
+        
+        cameraProvider.unbindAll();
+        
+        if (isVideoMode) {
+            Recorder recorder = new Recorder.Builder().setQualitySelector(QualitySelector.from(Quality.HD)).build();
+            videoCapture = VideoCapture.withOutput(recorder);
+            camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, videoCapture);
+        } else {
+            imageCapture = new ImageCapture.Builder().setFlashMode(flashMode).build();
+            camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageCapture);
+        }
     }
 
     private void startRecording() {
@@ -236,10 +236,14 @@ public class MainActivity extends AppCompatActivity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             values.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/GPSMapCamera");
         }
+        
+        // Burn location into Metadata - Permanent Burn for Gallery Info
         if (currentLocation != null) {
             values.put(MediaStore.Video.Media.LATITUDE, currentLocation.getLatitude());
             values.put(MediaStore.Video.Media.LONGITUDE, currentLocation.getLongitude());
+            values.put(MediaStore.Video.Media.DESCRIPTION, "GPS: " + currentAddr + " | " + tvDateTime.getText());
         }
+        
         MediaStoreOutputOptions options = new MediaStoreOutputOptions.Builder(getContentResolver(), MediaStore.Video.Media.EXTERNAL_CONTENT_URI).setContentValues(values).build();
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return;
         
@@ -262,6 +266,7 @@ public class MainActivity extends AppCompatActivity {
                     if (!finalizeEvent.hasError()) {
                         lastSavedUri = finalizeEvent.getOutputResults().getOutputUri();
                         updateGalleryThumb(null, lastSavedUri);
+                        Toast.makeText(MainActivity.this, "Video Saved with Location Info!", Toast.LENGTH_SHORT).show();
                     }
                 });
                 recording = null;
@@ -283,7 +288,7 @@ public class MainActivity extends AppCompatActivity {
                         tvLatLong.setText(String.format(Locale.getDefault(), "Lat: %.6f, Long: %.6f", loc.getLatitude(), loc.getLongitude()));
                         tvDateTime.setText(new SimpleDateFormat("EEEE, MMM d, yyyy HH:mm:ss", Locale.getDefault()).format(new Date()));
                     });
-                    if (System.currentTimeMillis() - lastAddressUpdate > 10000) fetchAddress(loc);
+                    if (System.currentTimeMillis() - lastAddressUpdate > 15000) fetchAddress(loc);
                 }
             }
         };
@@ -292,16 +297,12 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void checkNetworkStatus() {
-        cameraExecutor.execute(() -> {
-            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-            Network network = cm.getActiveNetwork();
-            NetworkCapabilities caps = cm.getNetworkCapabilities(network);
-            boolean connected = caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
-            runOnUiThread(() -> {
-                tvGpsStatus.setText(connected ? "GPS ACTIVE" : "NO INTERNET / GPS OFF");
-                tvGpsStatus.setTextColor(connected ? Color.GREEN : Color.RED);
-            });
+    private void registerNetworkCallback() {
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        NetworkRequest request = new NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build();
+        cm.registerNetworkCallback(request, new ConnectivityManager.NetworkCallback() {
+            @Override public void onAvailable(@NonNull Network n) { runOnUiThread(() -> { if(tvGpsStatus != null) { tvGpsStatus.setText("GPS ACTIVE"); tvGpsStatus.setTextColor(Color.GREEN); } }); }
+            @Override public void onLost(@NonNull Network n) { runOnUiThread(() -> { if(tvGpsStatus != null) { tvGpsStatus.setText("NO INTERNET / GPS OFF"); tvGpsStatus.setTextColor(Color.RED); } }); }
         });
     }
 
@@ -327,18 +328,18 @@ public class MainActivity extends AppCompatActivity {
         File photoFile = new File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), System.currentTimeMillis() + ".jpg");
         imageCapture.takePicture(new ImageCapture.OutputFileOptions.Builder(photoFile).build(), cameraExecutor, new ImageCapture.OnImageSavedCallback() {
             @Override public void onImageSaved(@NonNull ImageCapture.OutputFileResults res) { processAndSave(photoFile); }
-            @Override public void onError(@NonNull ImageCaptureException e) { }
+            @Override public void onError(@NonNull ImageCaptureException e) { Log.e(TAG, "Capture failed", e); }
         });
     }
 
-    private void processAndSave(File file) {
-        Bitmap bitmap = BitmapFactory.decodeFile(file.getAbsolutePath());
+    private void processAndSave(File photoFile) {
+        Bitmap bitmap = BitmapFactory.decodeFile(photoFile.getAbsolutePath());
         if (bitmap == null) return;
-        bitmap = handleRotation(file, bitmap);
+        bitmap = handleRotation(photoFile, bitmap);
         Bitmap mutable = bitmap.copy(Bitmap.Config.ARGB_8888, true);
         Canvas canvas = new Canvas(mutable);
         int w = mutable.getWidth(), h = mutable.getHeight();
-        Paint p = new Paint(); p.setColor(Color.parseColor("#AA000000"));
+        Paint p = new Paint(); p.setColor(Color.parseColor("#99000000"));
         int margin = w/20, fontSize = w/30;
         String txt = tvLatLong.getText() + "\n" + tvDateTime.getText() + "\n" + currentAddr;
         canvas.drawRect(0, h-(fontSize*6), w, h, p);
@@ -346,7 +347,7 @@ public class MainActivity extends AppCompatActivity {
         float x = margin, y = h - (fontSize * 4);
         for (String line : txt.split("\n")) { canvas.drawText(line, x, y, p); y += fontSize + 10; }
         saveImage(mutable);
-        file.delete();
+        photoFile.delete(); // Fixed compilation error
     }
 
     private void saveImage(Bitmap bitmap) {
@@ -375,7 +376,7 @@ public class MainActivity extends AppCompatActivity {
                 ivGalleryThumb.setImageBitmap(ThumbnailUtils.extractThumbnail(bitmap, 150, 150));
             } else {
                 ivGalleryThumb.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
-                ivGalleryThumb.setImageResource(android.R.drawable.ic_menu_gallery);
+                ivGalleryThumb.setImageResource(R.drawable.outline_gallery_thumbnail_24);
             }
         });
     }
@@ -385,6 +386,7 @@ public class MainActivity extends AppCompatActivity {
             int o = new ExifInterface(f.getAbsolutePath()).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1);
             Matrix m = new Matrix();
             if (o == 6) m.postRotate(90); else if (o == 3) m.postRotate(180); else if (o == 8) m.postRotate(270);
+            else return b;
             return Bitmap.createBitmap(b, 0, 0, b.getWidth(), b.getHeight(), m, true);
         } catch (Exception e) { return b; }
     }
@@ -395,7 +397,6 @@ public class MainActivity extends AppCompatActivity {
         flashMode = (flashMode == ImageCapture.FLASH_MODE_OFF) ? ImageCapture.FLASH_MODE_ON : ImageCapture.FLASH_MODE_OFF;
         btnFlash.setImageResource(flashMode == ImageCapture.FLASH_MODE_ON ? R.drawable.baseline_flash_on_24 : R.drawable.outline_flash_off_24);
         btnFlash.setColorFilter(flashMode == ImageCapture.FLASH_MODE_ON ? Color.YELLOW : Color.WHITE);
-        
         if (camera != null) {
             camera.getCameraControl().enableTorch(flashMode == ImageCapture.FLASH_MODE_ON);
         }
@@ -407,6 +408,6 @@ public class MainActivity extends AppCompatActivity {
         btnGrid.setColorFilter(isGridVisible ? Color.YELLOW : Color.WHITE);
     }
 
-    private Runnable timerRunnable = new Runnable() { @Override public void run() { long s = (System.currentTimeMillis() - startTime) / 1000; tvVideoTimer.setText(String.format(Locale.getDefault(), "%02d:%02d", s/60, s%60)); timerHandler.postDelayed(this, 1000); } };
+    private Runnable timerRunnable = new Runnable() { @Override public void run() { long s = (System.currentTimeMillis() - startTime) / 1000; tvVideoTimer.setText(String.format(Locale.getDefault(), "%02d:%02d:%02d", s/3600, (s%3600)/60, s%60)); timerHandler.postDelayed(this, 1000); } };
     @Override protected void onDestroy() { super.onDestroy(); cameraExecutor.shutdown(); if (fusedLocationClient != null && locationCallback != null) fusedLocationClient.removeLocationUpdates(locationCallback); }
 }
